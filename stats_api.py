@@ -1,182 +1,186 @@
-import time
-import re
+#!/usr/bin/env python3
+"""Miner watcher for the Nock ZK miner (gigahash.cloud).
+
+Tails the miner's screen log, parses total and per-GPU hashrate and serves them
+as JSON on GET / and GET /stats (standard library only, no pip). The last few
+log lines are included too, so extra fields a miner prints (power, VRAM, ...)
+can be checked by eye and new miners' parsers can be written from real output.
+
+Only total_hashrate and gpus[].hashrate are part of the contract, because every
+miner prints those. To support another miner, change HEADER_REGEX and
+parse_gpu_row.
+
+Nock table the parser reads:
+
+    | gigahash.cloud | NOCK ZK | Total 38.97 Mn/s | 0m | Accepted 0 | Stale 0 | Errors 0 |
+    | GPU | Device         | Rate       | Util | Temp | ...
+    | 0   | RTX 4070 SUPER | 38.97 Mn/s | 100% | 86 C | ...
+
+Environment: MINER_LOG (default /root/miner.log), WATCHER_PORT (8080),
+STALE_THRESHOLD_SEC (30), LOG_TAIL_LINES (30).
+"""
+import json
 import os
+import re
 import threading
-from flask import Flask, jsonify
+import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
-# =========================
-# V7 Script
-# =========================
-
-LOG_FILE = "/root/miner.log"
-STALE_THRESHOLD_SEC = 30
+LOG_FILE = os.environ.get("MINER_LOG", "/root/miner.log")
+PORT = int(os.environ.get("WATCHER_PORT", "8080"))
+STALE_THRESHOLD_SEC = float(os.environ.get("STALE_THRESHOLD_SEC", "30"))
+LOG_TAIL_LINES = int(os.environ.get("LOG_TAIL_LINES", "30"))
+MAX_TAIL_LINE_CHARS = 300
 READ_BACK_LINES = 300
 LOG_POLL_INTERVAL = 0.2
 
-# =========================
-# App & State
-# =========================
-
-app = Flask(__name__)
 state_lock = threading.Lock()
-
 state = {
-    "gpu_hashrates": {},
-    "last_update":   None
+    "total_hashrate": None,
+    "gpus": {},          # gpu_id -> {id, gpu_name, hashrate}, replaced per table
+    "last_update": None,
 }
+log_tail = deque(maxlen=LOG_TAIL_LINES)
 
-# =========================
-# ANSI stripper
-# Screen -L logs raw terminal output including color escape codes.
-# Strip them before any parsing.
-# =========================
+# screen -L logs raw terminal output, so strip colour and cursor escapes.
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
-ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+# | gigahash.cloud | NOCK ZK | Total 38.97 Mn/s | 0m | ...
+HEADER_REGEX = re.compile(r"^\|.*?\|\s*Total\s+([\d.]+)\s*\S+", re.IGNORECASE)
+RATE_REGEX = re.compile(r"^([\d.]+)\s*\S+$")
 
-def strip_ansi(s: str) -> str:
-    return ANSI_ESCAPE.sub("", s)
+_pending_gpus = {}
 
-# =========================
-# Regex
-# =========================
 
-GPU_REGEX = re.compile(
-    r"gpu=(\d+):(.+?)(?=\s+component=).*?hashrate_th_s=([\d.]+)",
-    re.IGNORECASE
-)
-
-# =========================
-# Debug helpers
-# =========================
-
-def dbg(tag: str, msg: str):
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+def dbg(tag, msg):
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
     print(f"[{ts}][{tag}] {msg}", flush=True)
 
-# =========================
-# Log Processing
-# =========================
 
-def process_line(line: str):
-    now     = time.time()
-    clean   = strip_ansi(line).rstrip("\n")
+def parse_gpu_row(line):
+    """Parse '| 0 | RTX 4070 SUPER | 38.97 Mn/s | ...' into id, name and hashrate."""
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    if len(cells) < 3 or not cells[0].isdigit():
+        return None
+    rate = RATE_REGEX.match(cells[2])
+    if not rate:
+        return None
+    return {"id": int(cells[0]), "gpu_name": cells[1], "hashrate": float(rate.group(1))}
 
-    gpu_match = GPU_REGEX.search(clean)
-    if gpu_match:
-        gpu_id   = int(gpu_match.group(1))
-        gpu_name = gpu_match.group(2).strip()
-        hashrate = float(gpu_match.group(3))
-        dbg("MATCH", f"gpu_id={gpu_id} name={gpu_name!r} hashrate={hashrate}")
 
+def process_line(line, now=None):
+    now = now if now is not None else time.time()
+    clean = ANSI_ESCAPE.sub("", line).replace("\r", "").strip()
+    if not clean:
+        return
+
+    with state_lock:
+        log_tail.append(clean[:MAX_TAIL_LINE_CHARS])
+
+    if not clean.startswith("|"):
+        return
+
+    header = HEADER_REGEX.match(clean)
+    if header:
+        _pending_gpus.clear()
         with state_lock:
-            state["gpu_hashrates"][gpu_id] = {
-                "name":      gpu_name,
-                "hashrate":  hashrate,
-                "last_seen": now
-            }
+            state["total_hashrate"] = float(header.group(1))
+            state["last_update"] = now
+        return
+
+    gpu = parse_gpu_row(clean)
+    if gpu:
+        _pending_gpus[gpu["id"]] = gpu
+        with state_lock:
+            # Swap in the whole table so a GPU that drops out disappears.
+            state["gpus"] = dict(_pending_gpus)
             state["last_update"] = now
 
-# =========================
-# Log Follower
-# =========================
+
+def tail_lines(path, count):
+    with open(path, "r", errors="replace") as f:
+        return list(deque(f, maxlen=count))
+
 
 def follow_log():
     last_inode = None
-    dbg("FOLLOWER", f"starting, watching {LOG_FILE!r}")
-
+    dbg("FOLLOWER", f"watching {LOG_FILE!r}")
     while True:
         if not os.path.exists(LOG_FILE):
-            dbg("FOLLOWER", "log file does not exist yet, waiting...")
             time.sleep(1)
             continue
-
         try:
-            stat  = os.stat(LOG_FILE)
-            inode = stat.st_ino
-
+            inode = os.stat(LOG_FILE).st_ino
             if inode != last_inode:
                 last_inode = inode
-                dbg("FOLLOWER", f"new/rotated file detected (inode={inode}), backfilling last {READ_BACK_LINES} lines")
-
-                with open(LOG_FILE, "r", errors="replace") as f:
-                    all_lines  = f.readlines()
-                    tail_lines = all_lines[-READ_BACK_LINES:]
-                    dbg("FOLLOWER", f"total lines in file={len(all_lines)}, backfilling {len(tail_lines)} lines")
-
-                    for line in tail_lines:
+                dbg("FOLLOWER", f"new file (inode={inode}), backfilling {READ_BACK_LINES} lines")
+                for line in tail_lines(LOG_FILE, READ_BACK_LINES):
+                    process_line(line)
+            with open(LOG_FILE, "r", errors="replace") as f:
+                f.seek(0, 2)
+                while True:
+                    line = f.readline()
+                    if line:
                         process_line(line)
-
-                    f.seek(0, 2)
-                    dbg("FOLLOWER", f"backfill done, tailing from offset={f.tell()}")
-
-                    while True:
-                        line = f.readline()
-                        if not line:
-                            time.sleep(LOG_POLL_INTERVAL)
-                            if not os.path.exists(LOG_FILE):
-                                dbg("FOLLOWER", "file disappeared, restarting")
-                                break
-                            try:
-                                if os.stat(LOG_FILE).st_ino != inode:
-                                    dbg("FOLLOWER", "inode changed (rotation), restarting")
-                                    break
-                            except OSError:
-                                break
-                            continue
-
-                        process_line(line)
-
-        except Exception as e:
-            dbg("FOLLOWER", f"exception: {e}")
-            import traceback
-            traceback.print_exc()
+                        continue
+                    time.sleep(LOG_POLL_INTERVAL)
+                    try:
+                        st = os.stat(LOG_FILE)
+                    except OSError:
+                        break
+                    if st.st_ino != inode or st.st_size < f.tell():
+                        dbg("FOLLOWER", "rotated or truncated, restarting")
+                        last_inode = None
+                        break
+        except Exception as e:  # keep the watcher alive whatever happens
+            dbg("FOLLOWER", f"exception: {e!r}")
             time.sleep(1)
 
-# =========================
-# API
-# =========================
 
-@app.route("/stats")
-def stats():
-    now = time.time()
-
+def snapshot(tail=LOG_TAIL_LINES, now=None):
+    now = now if now is not None else time.time()
     with state_lock:
-        active_gpus = {
-            gpu_id: gpu
-            for gpu_id, gpu in state["gpu_hashrates"].items()
-            if now - gpu["last_seen"] <= STALE_THRESHOLD_SEC
-        }
+        total = state["total_hashrate"]
+        last_update = state["last_update"]
+        gpus = [dict(g) for _, g in sorted(state["gpus"].items())]
+        lines = list(log_tail)[-tail:] if tail > 0 else []
+    stale = last_update is None or now - last_update > STALE_THRESHOLD_SEC
+    result = {
+        "total_hashrate": total,
+        "gpu_count": len(gpus),
+        "gpus": gpus,
+        "last_update": last_update,
+        "age_sec": None if last_update is None else round(now - last_update, 1),
+        "stale": stale,
+    }
+    if tail > 0:
+        result["log_tail"] = lines
+    return result
 
-        gpus_array = [
-            {
-                "id":        gpu_id,
-                "gpu_name":  gpu["name"],
-                "hashrate":  gpu["hashrate"],
-                "last_seen": gpu["last_seen"]
-            }
-            for gpu_id, gpu in sorted(active_gpus.items())
-        ]
 
-        last_update    = state["last_update"]
-        total_hashrate = sum(gpu["hashrate"] for gpu in active_gpus.values())
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        url = urlparse(self.path)
+        if url.path not in ("/", "/stats"):
+            self.send_error(404)
+            return
+        try:
+            tail = int(parse_qs(url.query).get("tail", [LOG_TAIL_LINES])[0])
+        except ValueError:
+            tail = LOG_TAIL_LINES
+        body = json.dumps(snapshot(tail)).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-    stale = (
-        last_update is None or
-        now - last_update > STALE_THRESHOLD_SEC
-    )
+    def log_message(self, *args):
+        pass
 
-    return jsonify({
-        "total_hashrate": total_hashrate,
-        "gpu_count":      len(gpus_array),
-        "gpus":           gpus_array,
-        "last_update":    last_update,
-        "stale":          stale
-    })
-
-# =========================
-# Main
-# =========================
 
 if __name__ == "__main__":
     threading.Thread(target=follow_log, daemon=True).start()
-    app.run(host="0.0.0.0", port=8080)
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
