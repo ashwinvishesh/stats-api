@@ -225,7 +225,8 @@ def kill_miner():
     """Kill the miner process; the startup script's shell loop starts it again."""
     if not MINER_PROCESS_PATTERN:
         return False  # an empty pattern would match every process
-    result = subprocess.run(["pkill", "-f", MINER_PROCESS_PATTERN], capture_output=True)
+    # SIGKILL, not the default SIGTERM: a miner stuck in the driver or stopped does not act on SIGTERM.
+    result = subprocess.run(["pkill", "-KILL", "-f", MINER_PROCESS_PATTERN], capture_output=True)
     return result.returncode == 0
 
 

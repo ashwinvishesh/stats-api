@@ -137,6 +137,23 @@ class SrbminerParserTest(unittest.TestCase):
         self.assertFalse(pattern.search("sh -c while true; do ./SRBMiner-MULTI --algorithm pearlhash; sleep 5; done"))
 
 
+class KillMinerTest(unittest.TestCase):
+    def test_the_miner_is_killed_with_sigkill_by_its_pattern(self):
+        from unittest import mock
+        with mock.patch.object(w.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
+                mock.patch.object(w, "MINER_PROCESS_PATTERN", r"^\./SRBMiner-MULTI"):
+            self.assertTrue(w.kill_miner())
+
+        run.assert_called_once_with(["pkill", "-KILL", "-f", r"^\./SRBMiner-MULTI"], capture_output=True)
+
+    def test_an_empty_pattern_kills_nothing(self):
+        from unittest import mock
+        with mock.patch.object(w.subprocess, "run") as run, mock.patch.object(w, "MINER_PROCESS_PATTERN", ""):
+            self.assertFalse(w.kill_miner())
+
+        run.assert_not_called()
+
+
 class HangTest(unittest.TestCase):
     def setUp(self):
         reset()
