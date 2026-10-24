@@ -142,6 +142,64 @@ class SrbminerParserTest(unittest.TestCase):
         self.assertFalse(pattern.search("sh -c while true; do ./SRBMiner-MULTI --algorithm pearlhash; sleep 5; done"))
 
 
+OZ_TABLE = [
+    " 2026-10-25 01:44:53  [pearlhash][de.pearl.herominers.com:1200]",
+    " 2026-10-25 01:44:53   #   Name         Hashrate      Shares   Eff           Temp   Fan   Power     CClk       MClk",
+    " 2026-10-25 01:44:53  ===================================================================================================",
+    " 2026-10-25 01:44:53   0   4070 SUPER   150.96 TH/s   5/0/0    855.83 GH/W   75°C   74%   176.4 W   2715 MHz   810 MHz",
+    " 2026-10-25 01:44:53       Total        150.96 TH/s   5/0/0    855.83 GH/W                176.4 W",
+    " 2026-10-25 01:44:53  ---------------------------------------------------------------------------------------------------",
+]
+OZ_OTHER_LINES = [
+    " 2026-10-25 01:41:23  OneZeroMiner 1.8.3",
+    " 2026-10-25 01:41:23  #0 pci: 01 4070 SUPER 12281 MB",
+    " 2026-10-25 01:41:24  [pearlhash] New job 00000000_2097152 height=133059",
+    " 2026-10-25 01:42:50  [pearlhash] GPU 0 Share accepted (285 ms)",
+    " 2026-10-25 01:41:53  Uptime: 0 days 00:00:29",
+]
+
+
+class OnezerominerParserTest(unittest.TestCase):
+    def setUp(self):
+        reset()
+
+    def feed(self, lines, now=100):
+        for line in lines:
+            w.process_line(line, now=now, parse=w.parse_onezerominer_line)
+
+    def test_a_table_gives_total_and_gpu_rate_in_terahashes(self):
+        self.feed(OZ_TABLE)
+        snap = w.snapshot(now=101)
+
+        self.assertEqual(snap["total_hashrate"], 150.96)
+        self.assertEqual(snap["gpus"], [{"id": 0, "gpu_name": "4070 SUPER", "hashrate": 150.96}])
+        self.assertFalse(snap["stale"])
+
+    def test_job_share_and_startup_lines_are_ignored(self):
+        self.feed(OZ_OTHER_LINES)
+
+        snap = w.snapshot(now=101)
+        self.assertIsNone(snap["total_hashrate"])
+        self.assertEqual(snap["gpus"], [])
+
+    def test_a_dropped_gpu_disappears_with_the_next_table(self):
+        two = OZ_TABLE[:4] + [
+            " 2026-10-25 01:44:53   1   4070 SUPER   100.00 TH/s   5/0/0    855.83 GH/W   75°C   74%   176.4 W   2715 MHz   810 MHz"
+        ] + OZ_TABLE[4:]
+        self.feed(two)
+        self.assertEqual([g["id"] for g in w.snapshot(now=101)["gpus"]], [0, 1])
+
+        self.feed(OZ_TABLE)
+        self.assertEqual([g["id"] for g in w.snapshot(now=101)["gpus"]], [0])
+
+    def test_the_process_pattern_hits_the_miner_but_not_the_shell_loop(self):
+        import re
+        pattern = re.compile(w.PROCESS_PATTERNS["onezerominer"])
+
+        self.assertTrue(pattern.search("./onezerominer -a pearlhash -o stratum+tcp://de.pearl.herominers.com:1200"))
+        self.assertFalse(pattern.search("sh -c while true; do ./onezerominer -a pearlhash; sleep 5; done"))
+
+
 class KillMinerTest(unittest.TestCase):
     def test_the_miner_is_killed_with_sigkill_by_its_pattern(self):
         from unittest import mock

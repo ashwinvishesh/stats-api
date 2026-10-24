@@ -9,7 +9,7 @@ can be checked by eye and new miners' parsers can be written from real output.
 Only total_hashrate and gpus[].hashrate are part of the contract, because every
 miner prints those. Each miner application (not each coin: the log format belongs to
 the miner, and a coin can be mined with several) has a parser in PARSERS, chosen with
-MINER, e.g. gigahash or srbminer; a
+MINER, e.g. gigahash, srbminer or onezerominer; a
 parser turns one clean log line into an event, a list of events, or None. Events:
 ("table", None) starts a new stats table (forgets the previous GPU rows),
 ("total", rate) and ("gpu", row). Hashrates must be converted to the coin's
@@ -49,7 +49,7 @@ LOG_TAIL_LINES = int(os.environ.get("LOG_TAIL_LINES", "30"))
 MINER = os.environ.get("MINER", "")
 # How long without a stats table before the numbers count as old. It must be well above the
 # miner's print interval (SRBMiner prints every 30 s, so 30 would flap).
-STALE_THRESHOLDS = {"gigahash": 30, "srbminer": 90}
+STALE_THRESHOLDS = {"gigahash": 30, "srbminer": 90, "onezerominer": 90}
 STALE_THRESHOLD_SEC = float(os.environ.get("STALE_THRESHOLD_SEC", STALE_THRESHOLDS.get(MINER, 30)))
 HANG_THRESHOLD_SEC = float(os.environ.get("HANG_THRESHOLD_SEC", "240"))
 MAX_RESTARTS = int(os.environ.get("MAX_RESTARTS", "5"))
@@ -145,10 +145,40 @@ def parse_srbminer_line(line):
     return None
 
 
-PARSERS = {"gigahash": parse_gigahash_line, "srbminer": parse_srbminer_line}
+# OneZeroMiner prints, every 30 s, after a timestamp:
+#  #   Name         Hashrate      Shares   Eff           Temp ...
+#  0   4070 SUPER   145.96 TH/s   0/0/0    629.50 GH/W   87°C ...
+#      Total        145.96 TH/s   0/0/0    629.50 GH/W          <- the total, after the rows
+OZ_TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+")
+OZ_TABLE_HEADER = re.compile(r"^#\s+Name\s+Hashrate\b")
+OZ_GPU_ROW = re.compile(r"^(\d+)\s+(.+?)\s{2,}([\d.]+)\s*([kMGTP]?H/s)\b")
+OZ_TOTAL = re.compile(r"^Total\s+([\d.]+)\s*([kMGTP]?H/s)\b")
+
+
+def parse_onezerominer_line(line):
+    body = OZ_TIMESTAMP.sub("", line).strip()
+    if OZ_TABLE_HEADER.match(body):
+        return ("table", None)
+    row = OZ_GPU_ROW.match(body)
+    if row:
+        rate = to_terahash(row.group(3), row.group(4))
+        if rate is not None:
+            return ("gpu", {"id": int(row.group(1)), "gpu_name": row.group(2), "hashrate": rate})
+        return None
+    total = OZ_TOTAL.match(body)
+    if total:
+        rate = to_terahash(total.group(1), total.group(2))
+        if rate is not None:
+            return ("total", rate)
+    return None
+
+
+PARSERS = {"gigahash": parse_gigahash_line, "srbminer": parse_srbminer_line,
+           "onezerominer": parse_onezerominer_line}
 # Regexes on the full command line of each miner. Anchored so the shell loop that launches the
 # miner, whose command line merely contains the name, is not matched.
-PROCESS_PATTERNS = {"gigahash": r"^\./gigahash-zk", "srbminer": r"^\./SRBMiner-MULTI"}
+PROCESS_PATTERNS = {"gigahash": r"^\./gigahash-zk", "srbminer": r"^\./SRBMiner-MULTI",
+                    "onezerominer": r"^\./onezerominer"}
 MINER_PROCESS_PATTERN = os.environ.get("MINER_PROCESS_PATTERN", PROCESS_PATTERNS.get(MINER, ""))
 
 
