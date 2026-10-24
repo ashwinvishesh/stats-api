@@ -29,7 +29,7 @@ Gigahash (Nock ZK) table the "gigahash" parser reads:
     | 0   | RTX 4070 SUPER | 38.97 Mn/s | 100% | 86 C | ...
 
 Environment: MINER (required: a key of PARSERS), MINER_LOG (default /root/miner.log), WATCHER_PORT
-(8080), STALE_THRESHOLD_SEC (30), LOG_TAIL_LINES (30), HANG_THRESHOLD_SEC (240,
+(8080), STALE_THRESHOLD_SEC (per miner, see STALE_THRESHOLDS), LOG_TAIL_LINES (30), HANG_THRESHOLD_SEC (240,
 0 turns restarting off), MAX_RESTARTS (5), MINER_PROCESS_PATTERN
 (^\\./gigahash-zk, which skips the shell loop that holds the same name).
 """
@@ -45,9 +45,12 @@ from urllib.parse import parse_qs, urlparse
 
 LOG_FILE = os.environ.get("MINER_LOG", "/root/miner.log")
 PORT = int(os.environ.get("WATCHER_PORT", "8080"))
-STALE_THRESHOLD_SEC = float(os.environ.get("STALE_THRESHOLD_SEC", "30"))
 LOG_TAIL_LINES = int(os.environ.get("LOG_TAIL_LINES", "30"))
 MINER = os.environ.get("MINER", "")
+# How long without a stats table before the numbers count as old. It must be well above the
+# miner's print interval (SRBMiner prints every 30 s, so 30 would flap).
+STALE_THRESHOLDS = {"gigahash": 30, "srbminer": 90}
+STALE_THRESHOLD_SEC = float(os.environ.get("STALE_THRESHOLD_SEC", STALE_THRESHOLDS.get(MINER, 30)))
 HANG_THRESHOLD_SEC = float(os.environ.get("HANG_THRESHOLD_SEC", "240"))
 MAX_RESTARTS = int(os.environ.get("MAX_RESTARTS", "5"))
 HANG_CHECK_INTERVAL = 5

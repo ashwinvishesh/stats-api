@@ -76,6 +76,11 @@ GPU0 : nvidia_geforce_rtx_4070_super                                          [a
 
 
 class RegistryTest(unittest.TestCase):
+    def test_every_parser_has_a_stale_threshold_above_a_30_second_print_interval_where_needed(self):
+        self.assertEqual(set(w.PARSERS), set(w.STALE_THRESHOLDS))
+        self.assertGreater(w.STALE_THRESHOLDS["srbminer"], 30)
+
+
     def test_every_parser_has_a_process_pattern_so_a_hung_miner_can_be_killed(self):
         self.assertEqual(set(w.PARSERS), set(w.PROCESS_PATTERNS))
 
