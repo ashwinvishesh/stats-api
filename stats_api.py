@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Miner watcher for the Nock ZK miner (gigahash.cloud).
+"""Miner watcher.
 
 Tails the miner's screen log, parses total and per-GPU hashrate and serves them
 as JSON on GET / and GET /stats (standard library only, no pip). The last few
@@ -7,21 +7,36 @@ log lines are included too, so extra fields a miner prints (power, VRAM, ...)
 can be checked by eye and new miners' parsers can be written from real output.
 
 Only total_hashrate and gpus[].hashrate are part of the contract, because every
-miner prints those. To support another miner, change HEADER_REGEX and
-parse_gpu_row.
+miner prints those. Each miner application (not each coin: the log format belongs to
+the miner, and a coin can be mined with several) has a parser in PARSERS, chosen with
+MINER, e.g. gigahash or srbminer; a
+parser turns one clean log line into an event, a list of events, or None. Events:
+("table", None) starts a new stats table (forgets the previous GPU rows),
+("total", rate) and ("gpu", row). Hashrates must be converted to the coin's
+baseline unit by the parser.
 
-Nock table the parser reads:
+The watcher also restarts a hung miner: when no usable hashrate has been seen
+for HANG_THRESHOLD_SEC it kills the miner process (matched by
+MINER_PROCESS_PATTERN, a regex on the full command line) and relies on the
+startup script's shell loop to start it again. After MAX_RESTARTS it gives up,
+so a miner that cannot run does not burn the rental. The JSON reports
+restart_count, last_restart_at and restart_gave_up.
+
+Gigahash (Nock ZK) table the "gigahash" parser reads:
 
     | gigahash.cloud | NOCK ZK | Total 38.97 Mn/s | 0m | Accepted 0 | Stale 0 | Errors 0 |
     | GPU | Device         | Rate       | Util | Temp | ...
     | 0   | RTX 4070 SUPER | 38.97 Mn/s | 100% | 86 C | ...
 
-Environment: MINER_LOG (default /root/miner.log), WATCHER_PORT (8080),
-STALE_THRESHOLD_SEC (30), LOG_TAIL_LINES (30).
+Environment: MINER (required: a key of PARSERS), MINER_LOG (default /root/miner.log), WATCHER_PORT
+(8080), STALE_THRESHOLD_SEC (30), LOG_TAIL_LINES (30), HANG_THRESHOLD_SEC (240,
+0 turns restarting off), MAX_RESTARTS (5), MINER_PROCESS_PATTERN
+(^\\./gigahash-zk, which skips the shell loop that holds the same name).
 """
 import json
 import os
 import re
+import subprocess
 import threading
 import time
 from collections import deque
@@ -32,6 +47,10 @@ LOG_FILE = os.environ.get("MINER_LOG", "/root/miner.log")
 PORT = int(os.environ.get("WATCHER_PORT", "8080"))
 STALE_THRESHOLD_SEC = float(os.environ.get("STALE_THRESHOLD_SEC", "30"))
 LOG_TAIL_LINES = int(os.environ.get("LOG_TAIL_LINES", "30"))
+MINER = os.environ.get("MINER", "")
+HANG_THRESHOLD_SEC = float(os.environ.get("HANG_THRESHOLD_SEC", "240"))
+MAX_RESTARTS = int(os.environ.get("MAX_RESTARTS", "5"))
+HANG_CHECK_INTERVAL = 5
 MAX_TAIL_LINE_CHARS = 300
 READ_BACK_LINES = 300
 LOG_POLL_INTERVAL = 0.2
@@ -41,6 +60,11 @@ state = {
     "total_hashrate": None,
     "gpus": {},          # gpu_id -> {id, gpu_name, hashrate}, replaced per table
     "last_update": None,
+    "last_good": None,   # last time a total above zero was seen
+    "started_at": None,  # when the watcher, or the last restart, began waiting for the miner
+    "restart_count": 0,
+    "last_restart_at": None,
+    "restart_gave_up": False,
 }
 log_tail = deque(maxlen=LOG_TAIL_LINES)
 
@@ -70,8 +94,64 @@ def parse_gpu_row(line):
     return {"id": int(cells[0]), "gpu_name": cells[1], "hashrate": float(rate.group(1))}
 
 
-def process_line(line, now=None):
+def parse_gigahash_line(line):
+    """The gigahash.cloud miner (Nock ZK) prints a header with the total, then one row per GPU."""
+    if not line.startswith("|"):
+        return None
+    header = HEADER_REGEX.match(line)
+    if header:
+        return [("table", None), ("total", float(header.group(1)))]
+    gpu = parse_gpu_row(line)
+    if gpu:
+        return ("gpu", gpu)
+    return None
+
+
+# SRBMiner-MULTI prints, every 30 s, after a timestamp:
+#  ID Name                         Hashrate    Power ...
+# #0  RTX 4070 SUPER            141.16 TH/s   241.7W ...
+#     Hashrate                  141.16 TH/s   241.7W ...        <- the total, after the rows
+SRB_TIMESTAMP = re.compile(r"^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\]\s*")
+SRB_TABLE_HEADER = re.compile(r"^ID\s+Name\s+Hashrate\b")
+SRB_GPU_ROW = re.compile(r"^#(\d+)\s+(.+?)\s+([\d.]+)\s*([kMGTP]?H/s)\b")
+SRB_TOTAL = re.compile(r"^Hashrate\s+([\d.]+)\s*([kMGTP]?H/s)\b")
+TERAHASH_PER_UNIT = {"H/s": 1e-12, "kH/s": 1e-9, "MH/s": 1e-6, "GH/s": 1e-3, "TH/s": 1.0, "PH/s": 1e3}
+
+
+def to_terahash(value, unit):
+    """Convert a rate to TH/s, the unit the Pearl baselines use; None for an unknown unit."""
+    factor = TERAHASH_PER_UNIT.get(unit)
+    return None if factor is None else float(value) * factor
+
+
+def parse_srbminer_line(line):
+    body = SRB_TIMESTAMP.sub("", line).strip()
+    if SRB_TABLE_HEADER.match(body):
+        return ("table", None)
+    row = SRB_GPU_ROW.match(body)
+    if row:
+        rate = to_terahash(row.group(3), row.group(4))
+        if rate is not None:
+            return ("gpu", {"id": int(row.group(1)), "gpu_name": row.group(2), "hashrate": rate})
+        return None
+    total = SRB_TOTAL.match(body)
+    if total:
+        rate = to_terahash(total.group(1), total.group(2))
+        if rate is not None:
+            return ("total", rate)
+    return None
+
+
+PARSERS = {"gigahash": parse_gigahash_line, "srbminer": parse_srbminer_line}
+# Regexes on the full command line of each miner. Anchored so the shell loop that launches the
+# miner, whose command line merely contains the name, is not matched.
+PROCESS_PATTERNS = {"gigahash": r"^\./gigahash-zk", "srbminer": r"^\./SRBMiner-MULTI"}
+MINER_PROCESS_PATTERN = os.environ.get("MINER_PROCESS_PATTERN", PROCESS_PATTERNS.get(MINER, ""))
+
+
+def process_line(line, now=None, parse=None):
     now = now if now is not None else time.time()
+    parse = parse or PARSERS[MINER]
     clean = ANSI_ESCAPE.sub("", line).replace("\r", "").strip()
     if not clean:
         return
@@ -79,24 +159,26 @@ def process_line(line, now=None):
     with state_lock:
         log_tail.append(clean[:MAX_TAIL_LINE_CHARS])
 
-    if not clean.startswith("|"):
+    events = parse(clean)
+    if events is None:
         return
-
-    header = HEADER_REGEX.match(clean)
-    if header:
-        _pending_gpus.clear()
-        with state_lock:
-            state["total_hashrate"] = float(header.group(1))
-            state["last_update"] = now
-        return
-
-    gpu = parse_gpu_row(clean)
-    if gpu:
-        _pending_gpus[gpu["id"]] = gpu
-        with state_lock:
-            # Swap in the whole table so a GPU that drops out disappears.
-            state["gpus"] = dict(_pending_gpus)
-            state["last_update"] = now
+    if isinstance(events, tuple):
+        events = [events]
+    for kind, value in events:
+        if kind == "table":
+            _pending_gpus.clear()
+        elif kind == "total":
+            with state_lock:
+                state["total_hashrate"] = value
+                state["last_update"] = now
+                if value > 0:
+                    state["last_good"] = now
+        else:
+            _pending_gpus[value["id"]] = value
+            with state_lock:
+                # Swap in the whole table so a GPU that drops out disappears.
+                state["gpus"] = dict(_pending_gpus)
+                state["last_update"] = now
 
 
 def tail_lines(path, count):
@@ -139,6 +221,56 @@ def follow_log():
             time.sleep(1)
 
 
+def kill_miner():
+    """Kill the miner process; the startup script's shell loop starts it again."""
+    if not MINER_PROCESS_PATTERN:
+        return False  # an empty pattern would match every process
+    result = subprocess.run(["pkill", "-f", MINER_PROCESS_PATTERN], capture_output=True)
+    return result.returncode == 0
+
+
+def check_hang(now=None, kill=kill_miner):
+    """Restart the miner when it has shown no usable hashrate for HANG_THRESHOLD_SEC.
+
+    The clock starts when the watcher starts or at the last restart, so a miner that
+    is still starting up gets the whole threshold. Returns True when it killed the miner.
+    """
+    if HANG_THRESHOLD_SEC <= 0:
+        return False
+    now = now if now is not None else time.time()
+    with state_lock:
+        if state["started_at"] is None:
+            state["started_at"] = now
+        if state["restart_gave_up"]:
+            return False
+        since = max(state["started_at"], state["last_good"] or 0)
+        if now - since <= HANG_THRESHOLD_SEC:
+            return False
+        if state["restart_count"] >= MAX_RESTARTS:
+            state["restart_gave_up"] = True
+            dbg("HANG", f"no hashrate for {now - since:.0f}s and {MAX_RESTARTS} restarts used, giving up")
+            return False
+        state["restart_count"] += 1
+        state["last_restart_at"] = now
+        state["started_at"] = now
+        state["total_hashrate"] = None
+        state["gpus"] = {}
+        count = state["restart_count"]
+    dbg("HANG", f"no hashrate for {now - since:.0f}s, killing the miner (restart {count} of {MAX_RESTARTS})")
+    if not kill():
+        dbg("HANG", "no miner process matched " + repr(MINER_PROCESS_PATTERN))
+    return True
+
+
+def watch_for_hang():
+    while True:
+        time.sleep(HANG_CHECK_INTERVAL)
+        try:
+            check_hang()
+        except Exception as e:  # keep the watcher alive whatever happens
+            dbg("HANG", f"exception: {e!r}")
+
+
 def snapshot(tail=LOG_TAIL_LINES, now=None):
     now = now if now is not None else time.time()
     with state_lock:
@@ -146,6 +278,9 @@ def snapshot(tail=LOG_TAIL_LINES, now=None):
         last_update = state["last_update"]
         gpus = [dict(g) for _, g in sorted(state["gpus"].items())]
         lines = list(log_tail)[-tail:] if tail > 0 else []
+        restart_count = state["restart_count"]
+        last_restart_at = state["last_restart_at"]
+        gave_up = state["restart_gave_up"]
     stale = last_update is None or now - last_update > STALE_THRESHOLD_SEC
     result = {
         "total_hashrate": total,
@@ -154,6 +289,9 @@ def snapshot(tail=LOG_TAIL_LINES, now=None):
         "last_update": last_update,
         "age_sec": None if last_update is None else round(now - last_update, 1),
         "stale": stale,
+        "restart_count": restart_count,
+        "last_restart_at": last_restart_at,
+        "restart_gave_up": gave_up,
     }
     if tail > 0:
         result["log_tail"] = lines
@@ -182,5 +320,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if MINER not in PARSERS:
+        raise SystemExit(f"MINER must be one of {sorted(PARSERS)}, got {MINER!r}")
     threading.Thread(target=follow_log, daemon=True).start()
+    threading.Thread(target=watch_for_hang, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
